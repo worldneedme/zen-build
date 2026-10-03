@@ -1,0 +1,163 @@
+name: Build WONDERX ZEN
+
+# Public build-only repo. The private source is fetched with a read-only
+# deploy key, so source code is never made public.
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private source branch, tag or commit to build
+        required: true
+        default: codex/tauri-v4.1
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wonderxzen-build
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: worldneedme/WonderxZen
+          ref: ${{ inputs.source_ref }}
+          ssh-key: ${{ secrets.SOURCE_READ_KEY }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Stamp release version
+        shell: pwsh
+        run: |
+          # Every build gets its own version (major.minor from tauri.conf.json,
+          # patch = run number) so the in-app update check can compare them.
+          $conf = 'src-tauri/tauri.conf.json'
+          $base = ((Get-Content $conf -Raw | ConvertFrom-Json).version -split '\.')[0..1] -join '.'
+          # Run numbers here restart at 1; builds 1-42 happened in the source repo.
+          $version = "$base.$([int]${{ github.run_number }} + 42)"
+          (Get-Content $conf -Raw) -replace '"version":\s*"[^"]+"', ('"version": "' + $version + '"') | Set-Content $conf -NoNewline
+          (Get-Content src-tauri/Cargo.toml -Raw) -replace '(?m)^version = "[^"]+"', ('version = "' + $version + '"') | Set-Content src-tauri/Cargo.toml -NoNewline
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Building WONDERX ZEN $version"
+
+      - name: Verify Rust Windows target
+        run: cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
+
+      - name: Build Tauri Windows package
+        run: npm run build
+        env:
+          # Signs the installer for the in-app updater (public key is in tauri.conf.json).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Smoke test installed Windows application
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem -LiteralPath 'src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'NSIS installer not found' }
+          $installDir = Join-Path $env:RUNNER_TEMP 'wonderxzen-smoke'
+          $installer = Start-Process -FilePath $setup.FullName -ArgumentList @('/S', "/D=$installDir") -PassThru -Wait -WindowStyle Hidden
+          if ($installer.ExitCode -ne 0) { throw "Installer exited with code $($installer.ExitCode)" }
+          $exe = Join-Path $installDir 'wonderxzen-tauri.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw "Windows executable not found: $exe" }
+          # Regression: builds <= 27 exited silently when %TEMP% held a stale
+          # lock file whose PID had been reused by another process after reboot.
+          $staleLock = Join-Path $env:TEMP 'wonderxzen-tauri.instance.lock'
+          Set-Content -LiteralPath $staleLock -Value $PID -Encoding ascii
+          # The app flips dark/light tray + window icons itself and reports here.
+          $report = Join-Path $env:RUNNER_TEMP 'icon-selftest.txt'
+          Remove-Item -LiteralPath $report -ErrorAction SilentlyContinue
+          $env:ZEN_ICON_SELFTEST = $report
+          $process = Start-Process -FilePath $exe -PassThru
+          try {
+            Start-Sleep -Seconds 8
+            if ($process.HasExited) { throw "Windows executable exited with code $($process.ExitCode)" }
+            if (-not (Test-Path -LiteralPath $report)) { throw 'Icon self-test did not report' }
+            $result = (Get-Content -LiteralPath $report -Raw).Trim()
+            if ($result -ne 'PASS') { throw "Icon self-test failed: $result" }
+            Write-Host 'PASS: dark/light tray and window icons switched'
+            foreach ($asset in 'zen-icon-dark.svg', 'zen-icon-light.svg') {
+              if (-not (Test-Path -LiteralPath (Join-Path 'frontend/dist' $asset))) { throw "Missing bundled asset: $asset" }
+            }
+
+            # A second launch must defer to the running instance and exit.
+            $second = Start-Process -FilePath $exe -PassThru
+            if (-not $second.WaitForExit(15000)) {
+              Stop-Process -Id $second.Id -Force
+              throw "Second instance did not exit; single-instance guard is broken"
+            }
+            if ($process.HasExited) { throw "First instance died when a second one was launched" }
+          } finally {
+            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+          }
+      - name: Prepare update manifest
+        shell: pwsh
+        run: |
+          $dir = 'src-tauri/target/release/bundle/nsis'
+          $setup = Get-ChildItem -LiteralPath $dir -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'NSIS installer not found' }
+          $sigPath = "$($setup.FullName).sig"
+          if (-not (Test-Path -LiteralPath $sigPath)) { throw "Updater signature not found: $sigPath" }
+          New-Item -ItemType Directory -Force 'release-out' | Out-Null
+          # GitHub turns spaces in asset names into dots, so upload under that
+          # name directly and the URL in latest.json always matches.
+          $name = "WONDERX.ZEN_$($env:APP_VERSION)_x64-setup.exe"
+          Copy-Item -LiteralPath $setup.FullName -Destination (Join-Path 'release-out' $name)
+          $manifest = [ordered]@{
+            version   = $env:APP_VERSION
+            notes     = "WONDERX ZEN $($env:APP_VERSION)"
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
+            platforms = [ordered]@{
+              'windows-x86_64' = [ordered]@{
+                signature = (Get-Content -LiteralPath $sigPath -Raw).Trim()
+                url       = "https://github.com/worldneedme/WonderxZen-Releases/releases/download/v$($env:APP_VERSION)/$name"
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath 'release-out/latest.json' -Encoding utf8NoBOM
+          Get-ChildItem 'release-out' | ForEach-Object { "$($_.Name)  $($_.Length)" }
+
+      - name: Upload Windows NSIS bundle
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: wonderxzen-tauri-windows-${{ github.run_number }}
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+      - name: Publish installer to public release repo
+        # The source repo is private; users and the in-app update check read
+        # releases from the public, release-only repo instead.
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: worldneedme/WonderxZen-Releases
+          token: ${{ secrets.RELEASES_TOKEN }}
+          tag_name: v${{ env.APP_VERSION }}
+          name: WONDERX ZEN ${{ env.APP_VERSION }}
+          prerelease: false
+          make_latest: true
+          generate_release_notes: false
+          files: |
+            release-out/*
