@@ -92,9 +92,13 @@ jobs:
           $env:ZEN_ICON_SELFTEST = $report
           $process = Start-Process -FilePath $exe -PassThru
           try {
-            Start-Sleep -Seconds 8
+            # Poll instead of a fixed sleep: cold runners start slowly.
+            for ($i = 0; $i -lt 40 -and -not (Test-Path -LiteralPath $report); $i++) {
+              if ($process.HasExited) { throw "Windows executable exited with code $($process.ExitCode)" }
+              Start-Sleep -Seconds 1
+            }
             if ($process.HasExited) { throw "Windows executable exited with code $($process.ExitCode)" }
-            if (-not (Test-Path -LiteralPath $report)) { throw 'Icon self-test did not report' }
+            if (-not (Test-Path -LiteralPath $report)) { throw 'Icon self-test did not report within 40s' }
             $result = (Get-Content -LiteralPath $report -Raw).Trim()
             if ($result -ne 'PASS') { throw "Icon self-test failed: $result" }
             Write-Host 'PASS: dark/light tray and window icons switched'
