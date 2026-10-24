@@ -98,6 +98,9 @@ jobs:
       - name: Verify Rust Windows target
         run: cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
 
+      - name: Run Rust unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
+
       - name: Build Tauri Windows package
         run: npm run build
         env:
