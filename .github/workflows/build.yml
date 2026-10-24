@@ -168,24 +168,28 @@ jobs:
           $setup = Get-ChildItem -LiteralPath $dir -Filter '*-setup.exe' | Select-Object -First 1
           if (-not $setup) { throw 'NSIS installer not found' }
           $sigPath = "$($setup.FullName).sig"
-          if (-not (Test-Path -LiteralPath $sigPath)) { throw "Updater signature not found: $sigPath" }
+          $hasSignature = Test-Path -LiteralPath $sigPath
           New-Item -ItemType Directory -Force 'release-out' | Out-Null
           # GitHub turns spaces in asset names into dots, so upload under that
           # name directly and the URL in latest.json always matches.
           $name = "WONDERX.ZEN_$($env:APP_VERSION)_x64-setup.exe"
           Copy-Item -LiteralPath $setup.FullName -Destination (Join-Path 'release-out' $name)
-          $manifest = [ordered]@{
-            version   = $env:APP_VERSION
-            notes     = "WONDERX ZEN $($env:APP_VERSION)"
-            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
-            platforms = [ordered]@{
-              'windows-x86_64' = [ordered]@{
-                signature = (Get-Content -LiteralPath $sigPath -Raw).Trim()
-                url       = "https://github.com/worldneedme/WonderxZen-Releases/releases/download/v$($env:APP_VERSION)/$name"
+          if ($hasSignature) {
+            $manifest = [ordered]@{
+              version   = $env:APP_VERSION
+              notes     = "WONDERX ZEN $($env:APP_VERSION)"
+              pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
+              platforms = [ordered]@{
+                'windows-x86_64' = [ordered]@{
+                  signature = (Get-Content -LiteralPath $sigPath -Raw).Trim()
+                  url       = "https://github.com/worldneedme/WonderxZen-Releases/releases/download/v$($env:APP_VERSION)/$name"
+                }
               }
             }
+            $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath 'release-out/latest.json' -Encoding utf8NoBOM
+          } else {
+            Write-Host 'No updater signature was produced; publishing the installer without latest.json.'
           }
-          $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath 'release-out/latest.json' -Encoding utf8NoBOM
           Get-ChildItem 'release-out' | ForEach-Object { "$($_.Name)  $($_.Length)" }
 
       - name: Upload Windows NSIS bundle
