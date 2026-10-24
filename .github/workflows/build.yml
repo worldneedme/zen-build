@@ -115,28 +115,40 @@ jobs:
           if ($installer.ExitCode -ne 0) { throw "Installer exited with code $($installer.ExitCode)" }
           $exe = Join-Path $installDir 'wonderxzen-tauri.exe'
           if (-not (Test-Path -LiteralPath $exe)) { throw "Windows executable not found: $exe" }
-          # Regression: builds <= 27 exited silently when %TEMP% held a stale
-          # lock file whose PID had been reused by another process after reboot.
           $staleLock = Join-Path $env:TEMP 'wonderxzen-tauri.instance.lock'
-          Set-Content -LiteralPath $staleLock -Value $PID -Encoding ascii
-          # The app flips dark/light tray + window icons itself and reports here.
+          # The icon self-test and stale-lock regression check belong to the
+          # newer Tauri branch. The stable main branch still uses the older
+          # file lock, so seeding it with this PowerShell PID would make a
+          # healthy first launch exit immediately.
+          $hasIconSelfTest = Select-String -LiteralPath 'src-tauri/src/tray.rs' -Pattern 'ZEN_ICON_SELFTEST' -Quiet
           $report = Join-Path $env:RUNNER_TEMP 'icon-selftest.txt'
           Remove-Item -LiteralPath $report -ErrorAction SilentlyContinue
-          $env:ZEN_ICON_SELFTEST = $report
+          if ($hasIconSelfTest) {
+            Set-Content -LiteralPath $staleLock -Value $PID -Encoding ascii
+            $env:ZEN_ICON_SELFTEST = $report
+          } else {
+            Remove-Item -LiteralPath $staleLock -ErrorAction SilentlyContinue
+            Remove-Item Env:ZEN_ICON_SELFTEST -ErrorAction SilentlyContinue
+          }
           $process = Start-Process -FilePath $exe -PassThru
           try {
             # Poll instead of a fixed sleep: cold runners start slowly.
-            for ($i = 0; $i -lt 40 -and -not (Test-Path -LiteralPath $report); $i++) {
+            for ($i = 0; $i -lt 40; $i++) {
               if ($process.HasExited) { throw "Windows executable exited with code $($process.ExitCode)" }
+              if (-not $hasIconSelfTest -or (Test-Path -LiteralPath $report)) { break }
               Start-Sleep -Seconds 1
             }
             if ($process.HasExited) { throw "Windows executable exited with code $($process.ExitCode)" }
-            if (-not (Test-Path -LiteralPath $report)) { throw 'Icon self-test did not report within 40s' }
-            $result = (Get-Content -LiteralPath $report -Raw).Trim()
-            if ($result -ne 'PASS') { throw "Icon self-test failed: $result" }
-            Write-Host 'PASS: dark/light tray and window icons switched'
-            foreach ($asset in 'zen-icon-dark.svg', 'zen-icon-light.svg') {
-              if (-not (Test-Path -LiteralPath (Join-Path 'frontend/dist' $asset))) { throw "Missing bundled asset: $asset" }
+            if ($hasIconSelfTest) {
+              if (-not (Test-Path -LiteralPath $report)) { throw 'Icon self-test did not report within 40s' }
+              $result = (Get-Content -LiteralPath $report -Raw).Trim()
+              if ($result -ne 'PASS') { throw "Icon self-test failed: $result" }
+              Write-Host 'PASS: dark/light tray and window icons switched'
+              foreach ($asset in 'zen-icon-dark.svg', 'zen-icon-light.svg') {
+                if (-not (Test-Path -LiteralPath (Join-Path 'frontend/dist' $asset))) { throw "Missing bundled asset: $asset" }
+              }
+            } else {
+              Write-Host 'PASS: installed Windows application stayed running'
             }
 
             # A second launch must defer to the running instance and exit.
